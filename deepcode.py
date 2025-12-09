@@ -15,6 +15,7 @@ import uuid
 import sqlite3
 import signal
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -30,6 +31,40 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.layout import Layout
 from rich.align import Align
+from rich.box import ROUNDED, DOUBLE, HEAVY, SQUARE
+from rich.rule import Rule
+from rich.measure import Measurement
+try:
+    import pyfiglet
+    HAS_FIGLET = True
+except ImportError:
+    HAS_FIGLET = False
+
+try:
+    import emojis
+    HAS_EMOJIS = True
+except ImportError:
+    HAS_EMOJIS = False
+    # Fallback emoji function
+    def emojis_encode(text):
+        emoji_map = {
+            ':file_folder:': '📁',
+            ':information:': 'ℹ️',
+            ':speech_balloon:': '💬',
+            ':door:': '🚪',
+            ':stop_sign:': '🛑',
+            ':rocket:': '🚀',
+            ':bust_in_silhouette:': '👤',
+            ':robot_face:': '🤖',
+            ':page_with_curl:': '📄',
+            ':arrow_forward:': '▶️',
+            ':wave:': '👋',
+            ':white_check_mark:': '✅',
+            ':brain:': '🧠',
+        }
+        for key, emoji in emoji_map.items():
+            text = text.replace(key, emoji)
+        return text
 import openai
 import requests
 from bs4 import BeautifulSoup
@@ -93,7 +128,14 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-console = Console()
+console = Console(
+    force_terminal=True,
+    color_system="auto",
+    width=None,
+    emoji=True,
+    markup=True,
+    highlight=True
+)
 
 # Global interrupt flag
 interrupt_flag = threading.Event()
@@ -422,9 +464,12 @@ def curl_request(url: str, method: str = "GET", headers: Dict[str, str] = None, 
 
 
 def format_response_with_syntax(text: str) -> None:
-    """Format response with proper syntax highlighting and structure"""
+    """Format response with Claude-like clean minimal styling"""
+    if not text.strip():
+        return
+    
     # Split into code blocks and text
-    code_block_pattern = r'```(\w+)?\n(.*?)```'
+    code_block_pattern = r'```(?:(?:(\w+))?(?::\s*([^\n]+))?)?\n(.*?)```'
     parts = []
     last_end = 0
     
@@ -437,8 +482,17 @@ def format_response_with_syntax(text: str) -> None:
         
         # Code block
         language = match.group(1) or 'text'
-        code = match.group(2)
-        parts.append(('code', language, code))
+        file_path = match.group(2) or ''
+        code = match.group(3) or ''
+        
+        # Remove file path from first line if it's there
+        if file_path and code.startswith(file_path):
+            code_lines = code.split('\n')
+            if len(code_lines) > 1 and code_lines[0].strip() == file_path:
+                code = '\n'.join(code_lines[1:])
+        
+        if code.strip():
+            parts.append(('code', language, code.strip(), file_path))
         last_end = match.end()
     
     # Remaining text
@@ -447,56 +501,151 @@ def format_response_with_syntax(text: str) -> None:
         if remaining:
             parts.append(('text', remaining))
     
-    # If no code blocks found, print as markdown
+    # Print in Claude-like clean style
     if not parts:
-        console.print(Markdown(text))
+        # Plain text - just print markdown cleanly without extra wrapping
+        console.print(Markdown(text, code_theme="monokai"), width=None)
         return
     
-    # Print formatted parts
-    for part in parts:
+    # Print each part in clean Claude style
+    for i, part in enumerate(parts):
         if part[0] == 'text':
-            console.print(Markdown(part[1]))
+            # Plain text with markdown - disable auto-wrapping to prevent weird spacing
+            console.print(Markdown(part[1], code_theme="monokai"), width=None)
+            if i < len(parts) - 1:
+                console.print()  # Spacing before code blocks
         elif part[0] == 'code':
-            language = part[1]
-            code = part[2]
-            console.print(Panel(
-                Syntax(code, language, theme="monokai", line_numbers=True),
-                title=f"[bold]{language}[/bold]",
-                border_style="blue"
-            ))
+            language = part[1] if len(part) > 1 else 'text'
+            code = part[2] if len(part) > 2 else ''
+            file_path = part[3] if len(part) > 3 else ''
+            
+            # Claude-style code block: minimal with ● marker
+            header = f"[dim]●[/dim] [bold]{language}[/bold]"
+            if file_path:
+                header += f" [dim]({file_path})[/dim]"
+            
+            # Show code - truncate if too long (like Claude)
+            code_lines = code.split('\n')
+            if len(code_lines) > 20:
+                preview_lines = code_lines[:15]
+                preview = '\n'.join(preview_lines)
+                console.print(f"{header}")
+                # Print code with syntax highlighting
+                syntax_obj = Syntax(preview, language, theme="monokai", line_numbers=False, word_wrap=True, padding=(0, 0))
+                console.print(syntax_obj)
+                console.print(f"[dim]  ⎿  … +{len(code_lines) - 15} lines (ctrl+o to expand)[/dim]")
+            else:
+                console.print(f"{header}")
+                syntax_obj = Syntax(code, language, theme="monokai", line_numbers=False, word_wrap=True, padding=(0, 0))
+                console.print(syntax_obj)
+            
+            if i < len(parts) - 1:
+                console.print()  # Spacing
 
 
 def stream_response(response, show_progress: bool = True) -> str:
-    """Stream and display response from API with progress indicator"""
+    """Stream and display response from API with clean Claude-like formatting"""
     collected_content = []
     
     if hasattr(response, '__iter__'):
-        # Show progress while streaming
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-            transient=True
-        ) as progress:
-            task = progress.add_task("[cyan]Generating response...", total=None)
-            
+        spinner_stop = threading.Event()
+        spinner_thread = None
+        
+        def show_spinner():
+            """Show spinner in separate thread until stopped"""
+            spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            i = 0
+            # Use raw stdout for reliable same-line updates in thread
+            while not spinner_stop.is_set() and not interrupt_flag.is_set():
+                if spinner_stop.wait(0.08):
+                    break
+                # Animate spinner on same line
+                char = spinner_chars[i % len(spinner_chars)]
+                sys.stdout.write(f"\r{char} Thinking...")
+                sys.stdout.flush()
+                i += 1
+                time.sleep(0.08)
+            # Clear spinner line
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+        
+        if show_progress:
+            # Start spinner thread immediately
+            spinner_thread = threading.Thread(target=show_spinner, daemon=True)
+            spinner_thread.start()
+        
+        try:
+            first_chunk = True
             for chunk in response:
                 if interrupt_flag.is_set():
-                    console.print("\n[yellow]Response interrupted by user[/yellow]")
+                    if show_progress:
+                        spinner_stop.set()
+                    console.print("\n[yellow]⚠️  Interrupted[/yellow]")
                     break
-                    
+                
                 if chunk.choices and len(chunk.choices) > 0:
                     delta = chunk.choices[0].delta
                     if hasattr(delta, 'content') and delta.content:
-                        collected_content.append(delta.content)
-                        console.print(delta.content, end="")
+                        content_chunk = delta.content
+                        collected_content.append(content_chunk)
+                        
+                        # Stop spinner and clear it immediately on first content chunk
+                        if show_progress and first_chunk:
+                            spinner_stop.set()
+                            first_chunk = False
+                            # Clear spinner line immediately - no waiting
+                            sys.stdout.write("\r\033[K")
+                            sys.stdout.flush()
+                            # Don't wait for thread - let it finish in background
+                            # Content will display immediately after this
+                
+        except KeyboardInterrupt:
+            if show_progress:
+                spinner_stop.set()
+            console.print("\n[yellow]⚠️  Interrupted[/yellow]")
+            interrupt_flag.set()
         
-        console.print()  # New line after streaming
-        return ''.join(collected_content)
+        # Ensure spinner thread finishes (don't wait if we already cleared it)
+        if show_progress and spinner_thread and spinner_thread.is_alive():
+            spinner_stop.set()
+            # Very brief wait to let spinner clear, then continue
+            spinner_thread.join(timeout=0.05)
+        
+        full_content = ''.join(collected_content)
+        
+        # Format and display in clean Claude style immediately after spinner clears
+        if full_content.strip():
+            format_response_in_panel(full_content)
+        else:
+            console.print()
+        
+        return full_content
     else:
+        # Non-streaming response
         content = response.choices[0].message.content
-        format_response_with_syntax(content)
+        if content:
+            format_response_in_panel(content)
         return content
+
+
+def _get_emoji(key: str) -> str:
+    """Helper to get emoji with fallback"""
+    if HAS_EMOJIS:
+        return emojis.encode(key)
+    else:
+        emoji_map = {
+            ':file_folder:': '📁', ':information:': 'ℹ️', ':speech_balloon:': '💬',
+            ':door:': '🚪', ':stop_sign:': '🛑', ':rocket:': '🚀',
+            ':bust_in_silhouette:': '👤', ':robot_face:': '🤖', ':page_with_curl:': '📄',
+            ':arrow_forward:': '▶️', ':wave:': '👋', ':white_check_mark:': '✅', ':brain:': '🧠',
+        }
+        return emoji_map.get(key, '')
+
+
+def format_response_in_panel(text: str) -> None:
+    """Format response in Claude-like clean minimal style"""
+    # Always use clean formatting (no heavy panels)
+    format_response_with_syntax(text)
 
 
 def parse_tool_calls(user_input: str, current_dir: str = None) -> Dict[str, Any]:
@@ -766,78 +915,71 @@ def interactive_mode(
         append_system_prompt=append_system_prompt
     )
     
-    # Show welcome with context info
-    console.print(Panel(
-        "[bold cyan]Deep Code - Interactive Chat Mode[/bold cyan]\n\n"
-        f"[dim]Current directory: {current_dir}[/dim]\n"
-        + (f"[dim]Additional directories: {', '.join(add_dirs)}[/dim]\n" if add_dirs else "") +
-        "[dim]Type 'exit' or 'quit' to end, 'clear' to clear context, 'help' for commands[/dim]\n"
-        "[yellow]💡 Tip: Press Ctrl+C during operations to interrupt and return to chat[/yellow]",
-        title="Deep Code",
-        border_style="cyan"
-    ))
-    console.print()
+    # Show minimal Claude-like welcome
+    console.print("[dim]Deep Code - Interactive Chat Mode[/dim]")
+    console.print(f"[dim]Current directory: {current_dir}[/dim]")
+    if add_dirs:
+        console.print(f"[dim]Additional directories: {', '.join(add_dirs)}[/dim]")
+    console.print("[dim]Type 'help' for commands, 'exit' to quit, Ctrl+C to interrupt[/dim]\n")
     
     # Handle initial query if provided
     if initial_query:
-        console.print(f"[bold blue]You:[/bold blue] {initial_query}\n")
+        # Will be shown in panel below
         
         # Auto-execute tools if needed
         tools = parse_tool_calls(initial_query, current_dir)
         tool_results = []
         
         if 'files' in tools:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-                transient=True
-            ) as progress:
-                task = progress.add_task("[cyan]Reading files...", total=None)
-                for file_path in tools['files']:
-                    file_content = load_file_context(file_path)
-                    if file_content:
-                        tool_results.append(f"File Content ({file_path}):\n{file_content}\n\n")
+            for file_path in tools['files']:
+                console.print(f"[dim]●[/dim] [bold]Read[/bold]({file_path})")
+                file_content = load_file_context(file_path)
+                if file_content:
+                    tool_results.append(f"File Content ({file_path}):\n{file_content}\n\n")
         
         if 'web_search' in tools:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-                transient=True
-            ) as progress:
-                progress.add_task("[cyan]🔍 Searching web...", total=None)
-                search_result = web_search(tools['web_search'])
-                tool_results.append(f"Web Search Result:\n{search_result}\n")
+            query_preview = tools['web_search'][:60] + ("..." if len(tools['web_search']) > 60 else "")
+            console.print(f"[dim]●[/dim] [bold]Web Search[/bold]({query_preview})")
+            search_result = web_search(tools['web_search'])
+            tool_results.append(f"Web Search Result:\n{search_result}\n")
         
         if 'curl' in tools:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-                transient=True
-            ) as progress:
-                progress.add_task("[cyan]🌐 Making HTTP request...", total=None)
-                curl_result = curl_request(tools['curl'])
-                tool_results.append(f"Curl Request Result:\n{curl_result}\n")
+            url_preview = tools['curl'][:60] + ("..." if len(tools['curl']) > 60 else "")
+            console.print(f"[dim]●[/dim] [bold]Fetch[/bold]({url_preview})")
+            curl_result = curl_request(tools['curl'])
+            tool_results.append(f"Fetch Result:\n{curl_result}\n")
         
         if 'bash' in tools:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-                transient=True
-            ) as progress:
-                progress.add_task(f"[cyan]⚙️  Executing: {tools['bash']}...", total=None)
-                stdout, stderr, code = execute_bash(tools['bash'], cwd=current_dir)
-                tool_results.append(f"Bash Command Result:\nCommand: {tools['bash']}\nReturn Code: {code}\nStdout:\n{stdout}\nStderr:\n{stderr}\n")
+            cmd_preview = tools['bash'][:60] + ("..." if len(tools['bash']) > 60 else "")
+            console.print(f"[dim]●[/dim] [bold]Bash[/bold]({cmd_preview})")
+            stdout, stderr, code = execute_bash(tools['bash'], cwd=current_dir)
+            # Format bash output in Claude style
+            output_lines = stdout.split('\n') if stdout else []
+            if len(output_lines) > 10:
+                preview = '\n'.join(output_lines[:8])
+                tool_results.append(f"Bash Output:\n{preview}\n  ⎿  … +{len(output_lines) - 8} more lines\nReturn Code: {code}\n")
+            else:
+                tool_results.append(f"Bash Output:\n{stdout}\nReturn Code: {code}\n")
+            if stderr:
+                tool_results.append(f"Stderr: {stderr}\n")
         
         if tool_results:
             initial_query = f"{initial_query}\n\n[Tool Execution Results]\n{''.join(tool_results)}"
         
         messages.append({"role": "user", "content": initial_query})
-        console.print("[bold green]DeepSeek:[/bold green]\n")
+        console.print(Panel(
+            Markdown(initial_query),
+            title=f"[bold blue]{_get_emoji(':bust_in_silhouette:')} You[/bold blue]",
+            border_style="blue",
+            box=ROUNDED,
+            padding=(0, 1)
+        ))
+        console.print()
+        
+        # Make API call and stream response (progress shown in stream_response)
         response = client.chat(messages, stream=True)
+        
+        # Format and show response with progress indicator
         assistant_response = stream_response(response, show_progress=True)
         messages.append({"role": "assistant", "content": assistant_response})
         
@@ -851,10 +993,12 @@ def interactive_mode(
     # Main interactive loop
     while True:
         try:
-            user_input = Prompt.ask("\n[bold blue]You[/bold blue]")
+            # Simple prompt - Rich Prompt.ask doesn't work well with markdown in prompt
+            console.print("[bold]>[/bold] ", end="")
+            user_input = input()
             
             if user_input.lower() in ['exit', 'quit', 'q']:
-                console.print("[yellow]Goodbye![/yellow]")
+                console.print(f"[yellow]{_get_emoji(':wave:')} Goodbye![/yellow]")
                 break
             
             if user_input.lower() == 'clear':
@@ -868,7 +1012,7 @@ def interactive_mode(
                             "role": "user",
                             "content": f"Here is the current directory context:\n\n{dir_context}"
                         })
-                console.print("[green]Context cleared (directory context reloaded)[/green]")
+                console.print(f"[green]{_get_emoji(':white_check_mark:')} Context cleared (directory context reloaded)[/green]")
                 continue
             
             if user_input.lower() in ['help', '?']:
@@ -900,68 +1044,59 @@ def interactive_mode(
             if not user_input.strip():
                 continue
             
+            # Add blank line after user input for spacing
+            console.print()
+            
             # Auto-detect and execute tools
             tools = parse_tool_calls(user_input, current_dir)
             tool_results = []
             
-            # Read files automatically
+            # Read files automatically - Claude style
             if 'files' in tools:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console,
-                    transient=True
-                ) as progress:
-                    task = progress.add_task("[cyan]📄 Reading files...", total=None)
-                    for file_path in tools['files']:
-                        file_content = load_file_context(file_path)
-                        if file_content:
-                            tool_results.append(f"File Content ({file_path}):\n{file_content}\n\n")
+                for file_path in tools['files']:
+                    console.print(f"[dim]●[/dim] [bold]Read[/bold]({file_path})")
+                    file_content = load_file_context(file_path)
+                    if file_content:
+                        tool_results.append(f"File Content ({file_path}):\n{file_content}\n\n")
             
-            # Web search
+            # Web search - Claude style
             if 'web_search' in tools:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console,
-                    transient=True
-                ) as progress:
-                    progress.add_task("[cyan]🔍 Searching web...", total=None)
-                    search_result = web_search(tools['web_search'])
-                    tool_results.append(f"Web Search Result:\n{search_result}\n")
+                query_preview = tools['web_search'][:60] + ("..." if len(tools['web_search']) > 60 else "")
+                console.print(f"[dim]●[/dim] [bold]Web Search[/bold]({query_preview})")
+                search_result = web_search(tools['web_search'])
+                tool_results.append(f"Web Search Result:\n{search_result}\n")
             
-            # HTTP requests
+            # HTTP requests - Claude style
             if 'curl' in tools:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console,
-                    transient=True
-                ) as progress:
-                    progress.add_task("[cyan]🌐 Making HTTP request...", total=None)
-                    curl_result = curl_request(tools['curl'])
-                    tool_results.append(f"Curl Request Result:\n{curl_result}\n")
+                url_preview = tools['curl'][:60] + ("..." if len(tools['curl']) > 60 else "")
+                console.print(f"[dim]●[/dim] [bold]Fetch[/bold]({url_preview})")
+                curl_result = curl_request(tools['curl'])
+                tool_results.append(f"Fetch Result:\n{curl_result}\n")
             
-            # Bash execution
+            # Bash execution - Claude style
             if 'bash' in tools:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console,
-                    transient=True
-                ) as progress:
-                    progress.add_task(f"[cyan]⚙️  Executing: {tools['bash']}...", total=None)
-                    stdout, stderr, code = execute_bash(tools['bash'], cwd=current_dir)
-                    tool_results.append(f"Bash Command Result:\nCommand: {tools['bash']}\nReturn Code: {code}\nStdout:\n{stdout}\nStderr:\n{stderr}\n")
+                cmd_preview = tools['bash'][:60] + ("..." if len(tools['bash']) > 60 else "")
+                console.print(f"[dim]●[/dim] [bold]Bash[/bold]({cmd_preview})")
+                stdout, stderr, code = execute_bash(tools['bash'], cwd=current_dir)
+                # Format bash output in Claude style
+                output_lines = stdout.split('\n') if stdout else []
+                if len(output_lines) > 10:
+                    preview = '\n'.join(output_lines[:8])
+                    tool_results.append(f"Bash Output:\n{preview}\n  ⎿  … +{len(output_lines) - 8} more lines\nReturn Code: {code}\n")
+                else:
+                    tool_results.append(f"Bash Output:\n{stdout}\nReturn Code: {code}\n")
+                if stderr:
+                    tool_results.append(f"Stderr: {stderr}\n")
             
             if tool_results:
                 user_input = f"{user_input}\n\n[Tool Execution Results]\n{''.join(tool_results)}"
             
             messages.append({"role": "user", "content": user_input})
             
-            console.print("[bold green]DeepSeek:[/bold green]\n")
+            # Make API call immediately (progress shown in stream_response)
             interrupt_flag.clear()  # Reset interrupt flag
             try:
+                # Start API call immediately - progress will show right away
                 response = client.chat(messages, stream=True)
                 assistant_response = stream_response(response, show_progress=True)
                 
