@@ -109,24 +109,55 @@ except ImportError:
         return blocks
     
     def detect_file_edit_request(user_input: str, response: str):
-        """Detect if user wants to edit a file"""
-        edit_keywords = ['edit', 'modify', 'update', 'change', 'fix', 'add', 'remove', 'replace', 'insert', 'delete', 'write', 'create', 'implement']
-        if not any(keyword in user_input.lower() for keyword in edit_keywords):
+        """Detect if user wants to edit a file - only on explicit edit requests"""
+        # More specific edit keywords - must be clear edit intent
+        # Removed vague words like 'add', 'remove', 'insert', 'delete' that could match anywhere
+        edit_keywords = ['edit', 'modify', 'update', 'change', 'fix', 'write to', 'write', 'create', 'implement in']
+        
+        # Check for explicit edit intent in user input
+        user_lower = user_input.lower()
+        has_edit_intent = any(keyword in user_lower for keyword in edit_keywords)
+        
+        if not has_edit_intent:
             return None
-        file_patterns = [
-            r'(?:in|to|from|file|the)\s+([^\s]+\.(?:py|js|ts|jsx|tsx|java|go|rs|cpp|c|h|rb|php|sh|md|txt|json|yml|yaml|html|css))',
-            r'["\']([^"\']+\.\w+)["\']',
-            r'([a-zA-Z0-9_/\.]+\.\w+)',
-        ]
-        file_path = None
-        for pattern in file_patterns:
-            match = re.search(pattern, user_input, re.IGNORECASE)
-            if match:
-                file_path = match.group(1)
-                break
+        
+        # Extract code blocks from response
         code_blocks = extract_code_blocks(response)
-        if file_path or code_blocks:
-            return {'file_path': file_path, 'code_blocks': code_blocks, 'full_response': response}
+        
+        # Only proceed if we have code blocks WITH file paths
+        # If code blocks exist but no file paths, it's just code examples, not an edit request
+        if not code_blocks:
+            return None
+        
+        # Look for file path in code blocks first (most reliable indicator)
+        file_path = None
+        for block in code_blocks:
+            if block.get('file_path') and block['file_path'].strip():
+                file_path = block['file_path'].strip()
+                break
+        
+        # If no file path in code blocks, try to extract from user input
+        # But be very specific - only match patterns that clearly indicate edit intent
+        if not file_path:
+            # More restrictive patterns - must have edit keyword near file path
+            file_patterns = [
+                r'(?:edit|modify|update|change|fix|write to|create|implement in)\s+["\']?([^\s"\'<>]+\.\w+)',  # "edit file.py" or "edit 'file.py'"
+                r'(?:edit|modify|update|change|fix)\s+(?:file|the file|in)\s+["\']?([^\s"\'<>]+\.\w+)',  # "edit the file.py"
+            ]
+            for pattern in file_patterns:
+                match = re.search(pattern, user_input, re.IGNORECASE)
+                if match:
+                    file_path = match.group(1)
+                    break
+        
+        # CRITICAL: Only return edit info if we have BOTH:
+        # 1. Code blocks with actual code content
+        # 2. A file path (either in code block or explicitly mentioned with edit intent)
+        # This prevents false positives when AI just shows code examples or discusses files
+        valid_code_blocks = [b for b in code_blocks if b.get('code', '').strip()]
+        if valid_code_blocks and file_path:
+            return {'file_path': file_path, 'code_blocks': valid_code_blocks, 'full_response': response}
+        
         return None
     
     def apply_code_changes(file_path: str, new_code: str, mode: str = 'replace'):
