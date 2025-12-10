@@ -60,7 +60,7 @@ Create a `.env` file in the project directory:
 ```
 DEEPSEEK_API_KEY=your_api_key_here
 DEEPSEEK_API_BASE=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-reasoner
+DEEPSEEK_MODEL=deepseek-chat
 ```
 
 See [INSTALL.md](INSTALL.md) for detailed installation instructions.
@@ -174,8 +174,8 @@ deepcode
 ### Model Selection
 
 ```bash
-# Use specific model (default is deepseek-reasoner)
-deepcode --model deepseek-reasoner "query"
+# Use specific model (default is deepseek-chat)
+deepcode --model deepseek-chat "query"
 
 # Override to use chat model
 deepcode --model deepseek-chat "query"
@@ -239,6 +239,6 @@ The tool uses DeepSeek API endpoints. Make sure you have a valid API key from [D
 Environment variables:
 - `DEEPSEEK_API_KEY` - Your API key (required)
 - `DEEPSEEK_API_BASE` - API base URL (default: https://api.deepseek.com)
-- `DEEPSEEK_MODEL` - Default model (default: deepseek-reasoner - research model for step-by-step reasoning)
+- `DEEPSEEK_MODEL` - Default model (default: deepseek-chat - conversational chat model)
 
-Note: The default model is `deepseek-reasoner` which is optimized for research tasks and logical reasoning. You can override this by setting `DEEPSEEK_MODEL` or using the `--model` flag.
+Note: The default model is `deepseek-chat` which is optimized for conversational interactions. You can override this by setting `DEEPSEEK_MODEL` or using the `--model` flag.

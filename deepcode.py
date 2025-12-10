@@ -20,6 +20,19 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Try to import platform-specific modules for key detection
+try:
+    import select
+    HAS_SELECT = True
+except ImportError:
+    HAS_SELECT = False
+
+try:
+    import msvcrt
+    IS_WINDOWS = True
+except ImportError:
+    IS_WINDOWS = False
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -139,10 +152,91 @@ console = Console(
 
 # Global interrupt flag
 interrupt_flag = threading.Event()
+esc_key_monitor_thread = None
+esc_key_monitor_active = threading.Event()
+
+def monitor_esc_key():
+    """Monitor stdin for ESC key press and set interrupt_flag"""
+    # Save terminal settings
+    old_settings = None
+    fd = None
+    
+    if not IS_WINDOWS and sys.stdin.isatty():
+        try:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setraw(fd)
+        except (ImportError, AttributeError, termios.error, OSError):
+            # If we can't set raw mode, we'll use a simpler approach
+            old_settings = None
+            fd = None
+    
+    try:
+        while not esc_key_monitor_active.is_set():
+            if esc_key_monitor_active.wait(0.1):
+                break
+            
+            # Check for input
+            if IS_WINDOWS:
+                # Windows: use msvcrt
+                try:
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch()
+                        if key == b'\x1b':  # ESC key
+                            interrupt_flag.set()
+                            break
+                except (IOError, OSError):
+                    break
+            elif HAS_SELECT and sys.stdin.isatty():
+                # Unix: use select to check if stdin has data
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if ready:
+                        char = sys.stdin.read(1)
+                        if char == '\x1b':  # ESC key
+                            interrupt_flag.set()
+                            # Try to clear remaining input buffer (escape sequences)
+                            try:
+                                if select.select([sys.stdin], [], [], 0)[0]:
+                                    sys.stdin.read(1)  # Read the '[' after ESC if it's an escape sequence
+                            except (IOError, OSError):
+                                pass
+                            break
+                except (IOError, OSError, ValueError):
+                    # If select fails, fall back to sleep
+                    time.sleep(0.1)
+            else:
+                # Fallback: just sleep (can't detect ESC without select)
+                time.sleep(0.1)
+    finally:
+        # Restore terminal settings
+        if old_settings is not None and fd is not None:
+            try:
+                import termios
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except (termios.error, OSError, ImportError):
+                pass
+
+def start_esc_monitor():
+    """Start monitoring for ESC key"""
+    global esc_key_monitor_thread
+    esc_key_monitor_active.clear()
+    interrupt_flag.clear()
+    if esc_key_monitor_thread is None or not esc_key_monitor_thread.is_alive():
+        esc_key_monitor_thread = threading.Thread(target=monitor_esc_key, daemon=True)
+        esc_key_monitor_thread.start()
+
+def stop_esc_monitor():
+    """Stop monitoring for ESC key"""
+    esc_key_monitor_active.set()
+    if esc_key_monitor_thread and esc_key_monitor_thread.is_alive():
+        esc_key_monitor_thread.join(timeout=0.5)
 
 # Default DeepSeek API configuration
 DEFAULT_API_BASE = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-reasoner"  # Research model for step-by-step reasoning
+DEFAULT_MODEL = "deepseek-chat"  # Chat model for conversational interactions
 
 # Session storage
 SESSION_DB = Path.home() / ".deepcode" / "sessions.db"
@@ -604,70 +698,75 @@ def stream_response(response, show_progress: bool = True) -> str:
     if hasattr(response, '__iter__'):
         spinner_stop = threading.Event()
         spinner_thread = None
+        spinner_stopped = threading.Event()
         
         def show_spinner():
             """Show spinner in separate thread until stopped"""
             spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             i = 0
-            # Use raw stdout for reliable same-line updates in thread
             while not spinner_stop.is_set() and not interrupt_flag.is_set():
-                if spinner_stop.wait(0.08):
+                if spinner_stop.is_set():
                     break
-                # Animate spinner on same line
                 char = spinner_chars[i % len(spinner_chars)]
                 sys.stdout.write(f"\r{char} Thinking...")
                 sys.stdout.flush()
                 i += 1
-                time.sleep(0.08)
-            # Clear spinner line
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
+                for _ in range(8):
+                    if spinner_stop.is_set():
+                        break
+                    time.sleep(0.01)
+            if spinner_stop.is_set():
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+                spinner_stopped.set()
         
         if show_progress:
-            # Start spinner thread immediately
+            # Start spinner immediately
+            sys.stdout.write("\r⠋ Thinking...")
+            sys.stdout.flush()
             spinner_thread = threading.Thread(target=show_spinner, daemon=True)
             spinner_thread.start()
         
+        start_esc_monitor()
+        
         try:
-            first_chunk = True
+            # Collect all content - don't display yet
             for chunk in response:
                 if interrupt_flag.is_set():
                     if show_progress:
                         spinner_stop.set()
-                    console.print("\n[yellow]⚠️  Interrupted[/yellow]")
+                    console.print("\n[yellow]⚠️  Interrupted (ESC or Ctrl+C)[/yellow]")
                     break
                 
                 if chunk.choices and len(chunk.choices) > 0:
                     delta = chunk.choices[0].delta
                     if hasattr(delta, 'content') and delta.content:
-                        content_chunk = delta.content
-                        collected_content.append(content_chunk)
-                        
-                        # Stop spinner and clear it immediately on first content chunk
-                        if show_progress and first_chunk:
-                            spinner_stop.set()
-                            first_chunk = False
-                            # Clear spinner line immediately - no waiting
-                            sys.stdout.write("\r\033[K")
-                            sys.stdout.flush()
-                            # Don't wait for thread - let it finish in background
-                            # Content will display immediately after this
+                        collected_content.append(delta.content)
                 
         except KeyboardInterrupt:
             if show_progress:
                 spinner_stop.set()
-            console.print("\n[yellow]⚠️  Interrupted[/yellow]")
+            console.print("\n[yellow]⚠️  Interrupted (ESC or Ctrl+C)[/yellow]")
             interrupt_flag.set()
-        
-        # Ensure spinner thread finishes (don't wait if we already cleared it)
-        if show_progress and spinner_thread and spinner_thread.is_alive():
-            spinner_stop.set()
-            # Very brief wait to let spinner clear, then continue
-            spinner_thread.join(timeout=0.05)
+        finally:
+            # Stop spinner ONLY when we're about to print content
+            if show_progress:
+                spinner_stop.set()
+                # Wait for spinner to clear
+                spinner_stopped.wait(timeout=0.2)
+                if not spinner_stopped.is_set():
+                    if spinner_thread and spinner_thread.is_alive():
+                        spinner_thread.join(timeout=0.1)
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                # Ensure spinner thread is completely done
+                if spinner_thread and spinner_thread.is_alive():
+                    spinner_thread.join(timeout=0.15)
+            stop_esc_monitor()
         
         full_content = ''.join(collected_content)
         
-        # Format and display in clean Claude style immediately after spinner clears
+        # Format and display the complete response AFTER spinner is cleared
         if full_content.strip():
             format_response_in_panel(full_content)
         else:
@@ -703,10 +802,11 @@ def format_response_in_panel(text: str) -> None:
 
 
 def parse_tool_calls_from_response(response_text: str, current_dir: str = None) -> Dict[str, Any]:
-    """Parse tool calls from assistant response text"""
+    """Parse tool calls from assistant response text - ONLY explicit tool calls"""
     tools = {}
     
-    # Look for explicit tool calls in response
+    # Look for explicit tool calls in response ONLY
+    # Don't auto-detect URLs - only trigger on explicit @curl/@web/@bash commands
     if '@web' in response_text.lower() or '@search' in response_text.lower():
         match = re.search(r'@(?:web|search)\s+(.+?)(?:\n|$|\.)', response_text, re.IGNORECASE | re.DOTALL)
         if match:
@@ -722,12 +822,8 @@ def parse_tool_calls_from_response(response_text: str, current_dir: str = None) 
         if match:
             tools['bash'] = match.group(1).strip()
     
-    # Look for URLs that should be fetched
-    url_pattern = r'https?://[^\s\)]+'
-    urls = re.findall(url_pattern, response_text)
-    if urls and 'curl' not in tools:
-        # Take first URL found
-        tools['curl'] = urls[0]
+    # REMOVED: Automatic URL detection - was too aggressive and triggered on any URL mentioned
+    # Only trigger curl requests when explicitly requested with @curl or @request
     
     return tools
 
@@ -776,28 +872,62 @@ def parse_tool_calls(user_input: str, current_dir: str = None) -> Dict[str, Any]
                     if test_path.exists():
                         tools.setdefault('files', []).append(file_path)
     
-    # Implicit bash commands - detect command-like queries
+    # Implicit bash commands - ONLY for very explicit direct command requests
+    # Don't try to parse natural language requests - let the AI handle those
+    # Only trigger for clear patterns like "run git status" or "execute npm install"
     bash_patterns = [
-        r'(?:run|execute|run the command)\s+(.+?)(?:\.|$|and)',
-        r'(?:git|npm|pip|python|node|docker)\s+([^\s]+(?:\s+[^\s]+)*)',
+        # Explicit "run <command>" or "execute <command>" at start
+        r'^(?:run|execute)\s+(git\s+.+?)(?:\.|$|\?)',
+        # Direct command-like patterns: "git status", "npm install", etc. (but only at start, not embedded)
+        r'^(git|npm|pip|python|node|docker)\s+([a-z]+\s+.*?)(?:\.|$|\?|and\s+.*$)',
     ]
     
     if not tools.get('bash'):  # Only if no explicit @bash
-        for pattern in bash_patterns:
-            match = re.search(pattern, user_input, re.IGNORECASE)
-            if match:
-                potential_cmd = match.group(1).strip()
-                # Don't auto-execute dangerous commands
-                dangerous = ['rm -rf', 'delete', 'format', 'mkfs']
-                if not any(d in potential_cmd.lower() for d in dangerous):
-                    tools['bash'] = potential_cmd
-                    break
+        # Skip if it's a natural language request (not a direct command)
+        if re.match(r'^(?:can you|please|will you|do|help me|i need|i want)', user_input, re.IGNORECASE):
+            pass  # Let AI handle natural language requests
+        else:
+            for pattern in bash_patterns:
+                match = re.search(pattern, user_input, re.IGNORECASE)
+                if match:
+                    # Extract the command - handle different pattern groups
+                    if match.lastindex >= 1:
+                        potential_cmd = match.group(1).strip()
+                        if match.lastindex >= 2:
+                            # For patterns with multiple groups, combine them
+                            potential_cmd = f"{match.group(1)} {match.group(2)}".strip()
+                    else:
+                        potential_cmd = match.group(0).strip()
+                    
+                    # Extract just the command part (remove "run" or "execute" prefix)
+                    potential_cmd = re.sub(r'^(?:run|execute)\s+', '', potential_cmd, flags=re.IGNORECASE).strip()
+                    
+                    # Don't auto-execute dangerous commands
+                    dangerous = ['rm -rf', 'delete', 'format', 'mkfs']
+                    if not any(d in potential_cmd.lower() for d in dangerous):
+                        tools['bash'] = potential_cmd
+                        break
     
-    # Implicit web search - detect questions needing web info
-    web_indicators = ['latest', 'current', 'recent', 'what is', 'how to', 'tutorial', 'documentation']
-    if not tools.get('web_search') and any(indicator in user_input.lower() for indicator in web_indicators):
-        # Extract the search query
-        tools['web_search'] = user_input[:100]  # Use part of query as search
+    # Implicit web search - ONLY for clear information-seeking questions
+    # Don't trigger on action requests or commands
+    web_search_contexts = [
+        'what is', 'what are', 'how to', 'how do', 'tutorial', 'documentation', 
+        'guide', 'example', 'explain', 'information about', 'tell me about'
+    ]
+    # Only trigger if:
+    # 1. It's clearly a question (ends with ?)
+    # 2. AND has question words/phrases
+    # 3. AND is NOT an action/command request
+    is_question = user_input.strip().endswith('?')
+    has_question_words = any(ctx in user_input.lower() for ctx in web_search_contexts)
+    is_action_request = any(cmd_word in user_input.lower() for cmd_word in [
+        'commit', 'push', 'pull', 'run', 'execute', 'do', 'check', 'git', 
+        'can you', 'please', 'will you', 'help me'
+    ])
+    
+    # Only trigger web search for clear information questions, not action requests
+    if not tools.get('web_search') and (is_question or has_question_words) and not is_action_request:
+        tools['web_search'] = user_input[:100]
     
     return tools
 
@@ -1013,7 +1143,7 @@ def interactive_mode(
         'web_search': Confirm.ask("  Allow automatic web searches?", default=True)
     }
     console.print()
-    console.print("[dim]Type 'help' for commands, 'exit' to quit, Ctrl+C to interrupt[/dim]\n")
+    console.print("[dim]Type 'help' for commands, 'exit' to quit, Ctrl+C or ESC to interrupt[/dim]\n")
     
     # Handle initial query if provided
     if initial_query:
@@ -1154,7 +1284,7 @@ def interactive_mode(
   • "Run git status"
   • "Edit file.py to add error handling"
 
-[yellow]Press Ctrl+C or ESC to interrupt operations[/yellow]
+[yellow]Press Ctrl+C or ESC to interrupt operations and return to chat[/yellow]
                 """)
                 continue
             
@@ -1217,6 +1347,7 @@ def interactive_mode(
                         console.print()
                     
                     # Start API call immediately - progress will show right away
+                    # ESC key monitoring will be started inside stream_response
                     response = client.chat(messages, stream=True)
                     assistant_response = stream_response(response, show_progress=True)
                     
@@ -1261,7 +1392,8 @@ def interactive_mode(
                         
                 except KeyboardInterrupt:
                     interrupt_flag.set()
-                    console.print("\n[yellow]⚠️  Operation interrupted. Returning to chat...[/yellow]")
+                    stop_esc_monitor()  # Ensure ESC monitor is stopped
+                    console.print("\n[yellow]⚠️  Operation interrupted (ESC or Ctrl+C). Returning to chat...[/yellow]")
                     break
             
             # Add separator after AI response completes
