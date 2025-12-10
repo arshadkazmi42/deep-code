@@ -464,83 +464,137 @@ def curl_request(url: str, method: str = "GET", headers: Dict[str, str] = None, 
 
 
 def format_response_with_syntax(text: str) -> None:
-    """Format response with Claude-like clean minimal styling"""
+    """Format response for CLI - clean, structured, left-aligned, and readable"""
     if not text.strip():
         return
     
-    # Split into code blocks and text
-    code_block_pattern = r'```(?:(?:(\w+))?(?::\s*([^\n]+))?)?\n(.*?)```'
-    parts = []
-    last_end = 0
+    # Parse and format content properly for CLI
+    lines = text.split('\n')
+    i = 0
+    in_code_block = False
+    code_language = ""
+    code_lines = []
+    prev_was_heading = False
+    prev_was_list = False
+    prev_empty = False
     
-    for match in re.finditer(code_block_pattern, text, re.DOTALL):
-        # Text before code block
-        if match.start() > last_end:
-            text_before = text[last_end:match.start()].strip()
-            if text_before:
-                parts.append(('text', text_before))
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        original_line = line
         
-        # Code block
-        language = match.group(1) or 'text'
-        file_path = match.group(2) or ''
-        code = match.group(3) or ''
-        
-        # Remove file path from first line if it's there
-        if file_path and code.startswith(file_path):
-            code_lines = code.split('\n')
-            if len(code_lines) > 1 and code_lines[0].strip() == file_path:
-                code = '\n'.join(code_lines[1:])
-        
-        if code.strip():
-            parts.append(('code', language, code.strip(), file_path))
-        last_end = match.end()
-    
-    # Remaining text
-    if last_end < len(text):
-        remaining = text[last_end:].strip()
-        if remaining:
-            parts.append(('text', remaining))
-    
-    # Print in Claude-like clean style
-    if not parts:
-        # Plain text - just print markdown cleanly without extra wrapping
-        console.print(Markdown(text, code_theme="monokai"), width=None)
-        return
-    
-    # Print each part in clean Claude style
-    for i, part in enumerate(parts):
-        if part[0] == 'text':
-            # Plain text with markdown - disable auto-wrapping to prevent weird spacing
-            console.print(Markdown(part[1], code_theme="monokai"), width=None)
-            if i < len(parts) - 1:
-                console.print()  # Spacing before code blocks
-        elif part[0] == 'code':
-            language = part[1] if len(part) > 1 else 'text'
-            code = part[2] if len(part) > 2 else ''
-            file_path = part[3] if len(part) > 3 else ''
-            
-            # Claude-style code block: minimal with ● marker
-            header = f"[dim]●[/dim] [bold]{language}[/bold]"
-            if file_path:
-                header += f" [dim]({file_path})[/dim]"
-            
-            # Show code - truncate if too long (like Claude)
-            code_lines = code.split('\n')
-            if len(code_lines) > 20:
-                preview_lines = code_lines[:15]
-                preview = '\n'.join(preview_lines)
-                console.print(f"{header}")
-                # Print code with syntax highlighting
-                syntax_obj = Syntax(preview, language, theme="monokai", line_numbers=False, word_wrap=True, padding=(0, 0))
-                console.print(syntax_obj)
-                console.print(f"[dim]  ⎿  … +{len(code_lines) - 15} lines (ctrl+o to expand)[/dim]")
+        # Handle code blocks
+        if stripped.startswith('```'):
+            # End current code block if open
+            if in_code_block:
+                if code_lines:
+                    code_content = '\n'.join(code_lines)
+                    syntax = Syntax(code_content, code_language, theme="monokai", line_numbers=False, word_wrap=True)
+                    console.print(syntax)
+                    console.print()  # Space after code block
+                in_code_block = False
+                code_lines = []
+                code_language = ""
+                prev_was_heading = False
+                prev_was_list = False
+                prev_empty = False
             else:
-                console.print(f"{header}")
-                syntax_obj = Syntax(code, language, theme="monokai", line_numbers=False, word_wrap=True, padding=(0, 0))
-                console.print(syntax_obj)
+                # Start new code block
+                in_code_block = True
+                code_language = stripped[3:].strip() or "text"
+                # Add spacing before code block if needed
+                if i > 0 and lines[i-1].strip():
+                    console.print()
+            i += 1
+            continue
+        
+        if in_code_block:
+            code_lines.append(original_line)  # Preserve original indentation
+            i += 1
+            continue
+        
+        # Handle headings - left-align with bold, proper spacing
+        if stripped.startswith('#'):
+            # Add spacing before heading if needed
+            if i > 0 and lines[i-1].strip() and not prev_was_heading:
+                console.print()
             
-            if i < len(parts) - 1:
-                console.print()  # Spacing
+            level = 0
+            while level < len(stripped) and stripped[level] == '#':
+                level += 1
+            heading_text = stripped[level:].strip()
+            if heading_text:
+                # Left-aligned bold heading (no centering)
+                if level == 1:
+                    console.print(f"[bold bright_white]{heading_text}[/bold bright_white]")
+                elif level == 2:
+                    console.print(f"[bold cyan]{heading_text}[/bold cyan]")
+                elif level == 3:
+                    console.print(f"[bold yellow]{heading_text}[/bold yellow]")
+                else:
+                    console.print(f"[bold]{heading_text}[/bold]")
+                prev_was_heading = True
+                prev_was_list = False
+                prev_empty = False
+            i += 1
+            continue
+        
+        # Handle lists - properly formatted and indented
+        numbered_match = re.match(r'^(\s*)(\d+)[\.\)]\s+(.+)', line)
+        bullet_match = re.match(r'^(\s*)[-*•]\s+(.+)', line)
+        
+        if numbered_match:
+            indent, num, content = numbered_match.groups()
+            # Add spacing before list if needed
+            if not prev_was_list and i > 0 and lines[i-1].strip():
+                console.print()
+            # Print numbered list item - properly aligned
+            console.print(f"{indent}{num}. {content}")
+            prev_was_list = True
+            prev_was_heading = False
+            prev_empty = False
+            i += 1
+            continue
+        elif bullet_match:
+            indent, content = bullet_match.groups()
+            # Add spacing before list if needed
+            if not prev_was_list and i > 0 and lines[i-1].strip():
+                console.print()
+            # Print bullet list item - properly aligned
+            console.print(f"{indent}• {content}")
+            prev_was_list = True
+            prev_was_heading = False
+            prev_empty = False
+            i += 1
+            continue
+        
+        # Reset list flag for non-list items
+        if prev_was_list:
+            prev_was_list = False
+        
+        # Handle regular text
+        if stripped:
+            # Regular paragraph text - just print as-is
+            console.print(original_line)
+            prev_was_heading = False
+            prev_empty = False
+            i += 1
+        else:
+            # Empty line - only add one if we haven't already
+            if not prev_empty:
+                console.print()
+                prev_empty = True
+            prev_was_heading = False
+            i += 1
+    
+    # Close any open code block
+    if in_code_block and code_lines:
+        code_content = '\n'.join(code_lines)
+        syntax = Syntax(code_content, code_language, theme="monokai", line_numbers=False, word_wrap=True)
+        console.print(syntax)
+    
+    # Final spacing
+    console.print()
 
 
 def stream_response(response, show_progress: bool = True) -> str:
@@ -646,6 +700,36 @@ def format_response_in_panel(text: str) -> None:
     """Format response in Claude-like clean minimal style"""
     # Always use clean formatting (no heavy panels)
     format_response_with_syntax(text)
+
+
+def parse_tool_calls_from_response(response_text: str, current_dir: str = None) -> Dict[str, Any]:
+    """Parse tool calls from assistant response text"""
+    tools = {}
+    
+    # Look for explicit tool calls in response
+    if '@web' in response_text.lower() or '@search' in response_text.lower():
+        match = re.search(r'@(?:web|search)\s+(.+?)(?:\n|$|\.)', response_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            tools['web_search'] = match.group(1).strip()
+    
+    if '@curl' in response_text.lower() or '@request' in response_text.lower():
+        match = re.search(r'@(?:curl|request)\s+(.+?)(?:\n|$|\.)', response_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            tools['curl'] = match.group(1).strip()
+    
+    if '@bash' in response_text.lower() or '@exec' in response_text.lower() or '@run' in response_text.lower():
+        match = re.search(r'@(?:bash|exec|run)\s+(.+?)(?:\n|$|\.)', response_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            tools['bash'] = match.group(1).strip()
+    
+    # Look for URLs that should be fetched
+    url_pattern = r'https?://[^\s\)]+'
+    urls = re.findall(url_pattern, response_text)
+    if urls and 'curl' not in tools:
+        # Take first URL found
+        tools['curl'] = urls[0]
+    
+    return tools
 
 
 def parse_tool_calls(user_input: str, current_dir: str = None) -> Dict[str, Any]:
@@ -916,10 +1000,19 @@ def interactive_mode(
     )
     
     # Show minimal Claude-like welcome
-    console.print("[dim]Deep Code - Interactive Chat Mode[/dim]")
-    console.print(f"[dim]Current directory: {current_dir}[/dim]")
+    console.print(f"[cyan]Deep Code - Interactive Chat Mode[/cyan]")
+    console.print(f"[dim]Directory: {current_dir}[/dim]\n")
     if add_dirs:
         console.print(f"[dim]Additional directories: {', '.join(add_dirs)}[/dim]")
+    
+    # Request permissions for automatic tool execution (ask once per session)
+    console.print("[yellow]Automatic Tool Execution Permissions:[/yellow]")
+    permissions = {
+        'curl': Confirm.ask("  Allow automatic curl/web requests?", default=True),
+        'bash': Confirm.ask("  Allow automatic bash command execution?", default=True),
+        'web_search': Confirm.ask("  Allow automatic web searches?", default=True)
+    }
+    console.print()
     console.print("[dim]Type 'help' for commands, 'exit' to quit, Ctrl+C to interrupt[/dim]\n")
     
     # Handle initial query if provided
@@ -932,79 +1025,98 @@ def interactive_mode(
         
         if 'files' in tools:
             for file_path in tools['files']:
-                console.print(f"[dim]●[/dim] [bold]Read[/bold]({file_path})")
+                console.print(f"[yellow]→ Reading: {file_path}[/yellow]")
                 file_content = load_file_context(file_path)
                 if file_content:
                     tool_results.append(f"File Content ({file_path}):\n{file_content}\n\n")
         
         if 'web_search' in tools:
-            query_preview = tools['web_search'][:60] + ("..." if len(tools['web_search']) > 60 else "")
-            console.print(f"[dim]●[/dim] [bold]Web Search[/bold]({query_preview})")
+            console.print(f"[yellow]→ Searching web: {tools['web_search'][:60]}...[/yellow]")
             search_result = web_search(tools['web_search'])
             tool_results.append(f"Web Search Result:\n{search_result}\n")
         
         if 'curl' in tools:
-            url_preview = tools['curl'][:60] + ("..." if len(tools['curl']) > 60 else "")
-            console.print(f"[dim]●[/dim] [bold]Fetch[/bold]({url_preview})")
+            console.print(f"[yellow]→ Fetching: {tools['curl'][:60]}...[/yellow]")
             curl_result = curl_request(tools['curl'])
             tool_results.append(f"Fetch Result:\n{curl_result}\n")
         
         if 'bash' in tools:
-            cmd_preview = tools['bash'][:60] + ("..." if len(tools['bash']) > 60 else "")
-            console.print(f"[dim]●[/dim] [bold]Bash[/bold]({cmd_preview})")
+            console.print(f"[yellow]→ Executing: {tools['bash'][:60]}...[/yellow]")
             stdout, stderr, code = execute_bash(tools['bash'], cwd=current_dir)
-            # Format bash output in Claude style
-            output_lines = stdout.split('\n') if stdout else []
-            if len(output_lines) > 10:
-                preview = '\n'.join(output_lines[:8])
-                tool_results.append(f"Bash Output:\n{preview}\n  ⎿  … +{len(output_lines) - 8} more lines\nReturn Code: {code}\n")
-            else:
-                tool_results.append(f"Bash Output:\n{stdout}\nReturn Code: {code}\n")
+            tool_results.append(f"Command Output:\n{stdout}\nReturn Code: {code}\n")
             if stderr:
-                tool_results.append(f"Stderr: {stderr}\n")
+                tool_results.append(f"Error: {stderr}\n")
         
         if tool_results:
             initial_query = f"{initial_query}\n\n[Tool Execution Results]\n{''.join(tool_results)}"
         
         messages.append({"role": "user", "content": initial_query})
-        console.print(Panel(
-            Markdown(initial_query),
-            title=f"[bold blue]{_get_emoji(':bust_in_silhouette:')} You[/bold blue]",
-            border_style="blue",
-            box=ROUNDED,
-            padding=(0, 1)
-        ))
-        console.print()
+        console.print(f"[cyan]> {initial_query}[/cyan]\n")
         
-        # Make API call and stream response (progress shown in stream_response)
-        response = client.chat(messages, stream=True)
-        
-        # Format and show response with progress indicator
-        assistant_response = stream_response(response, show_progress=True)
-        messages.append({"role": "assistant", "content": assistant_response})
-        
-        # Check if this was a file edit request
-        edit_info = detect_file_edit_request(initial_query, assistant_response)
-        if edit_info and edit_info.get('code_blocks'):
-            _handle_file_edit(edit_info, current_dir, console)
+        # Recursive tool execution loop for initial query
+        max_iterations = 10
+        iteration = 0
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Make API call and stream response (progress shown in stream_response)
+            response = client.chat(messages, stream=True)
+            
+            # Format and show response with progress indicator
+            assistant_response = stream_response(response, show_progress=True)
+            messages.append({"role": "assistant", "content": assistant_response})
+            
+            # Check if this was a file edit request
+            edit_info = detect_file_edit_request(initial_query, assistant_response)
+            if edit_info and edit_info.get('code_blocks'):
+                _handle_file_edit(edit_info, current_dir, console)
+            
+            # Parse tool calls from assistant response
+            tool_calls = parse_tool_calls_from_response(assistant_response, current_dir)
+            tool_results = []
+            
+            # Execute tools if permissions allow (permissions set earlier)
+            if 'web_search' in tool_calls and permissions['web_search']:
+                console.print(f"[yellow]→ Searching web: {tool_calls['web_search'][:60]}...[/yellow]")
+                search_result = web_search(tool_calls['web_search'])
+                tool_results.append(f"Web Search Result:\n{search_result}\n")
+            
+            if 'curl' in tool_calls and permissions['curl']:
+                console.print(f"[yellow]→ Fetching: {tool_calls['curl'][:60]}...[/yellow]")
+                curl_result = curl_request(tool_calls['curl'])
+                tool_results.append(f"Fetch Result:\n{curl_result}\n")
+            
+            if 'bash' in tool_calls and permissions['bash']:
+                console.print(f"[yellow]→ Executing: {tool_calls['bash'][:60]}...[/yellow]")
+                stdout, stderr, code = execute_bash(tool_calls['bash'], cwd=current_dir)
+                tool_results.append(f"Command Output:\n{stdout}\nReturn Code: {code}\n")
+                if stderr:
+                    tool_results.append(f"Error: {stderr}\n")
+            
+            # If tools were executed, add results and continue loop
+            if tool_results:
+                tool_message = "[Tool Execution Results]\n" + ''.join(tool_results)
+                messages.append({"role": "user", "content": tool_message})
+                # Continue loop to get AI response to tool results
+                continue
+            else:
+                # No more tool calls, break out of loop
+                break
         
         session_manager.update_session(session_id, messages)
     
     # Main interactive loop
     while True:
         try:
-            # Simple prompt - Rich Prompt.ask doesn't work well with markdown in prompt
-            console.print("[bold]>[/bold] ", end="")
+            console.print("> ", end="", style="cyan")
             user_input = input()
             
             if user_input.lower() in ['exit', 'quit', 'q']:
-                console.print(f"[yellow]{_get_emoji(':wave:')} Goodbye![/yellow]")
+                console.print("[yellow]Goodbye![/yellow]")
                 break
             
             if user_input.lower() == 'clear':
-                # Keep system message and directory context
                 messages = messages[:1] if messages else []
-                # Reload directory context
                 if current_dir:
                     dir_context = load_directory_context(current_dir)
                     if dir_context:
@@ -1012,33 +1124,27 @@ def interactive_mode(
                             "role": "user",
                             "content": f"Here is the current directory context:\n\n{dir_context}"
                         })
-                console.print(f"[green]{_get_emoji(':white_check_mark:')} Context cleared (directory context reloaded)[/green]")
+                console.print("[green]✓ Context cleared[/green]\n")
                 continue
             
             if user_input.lower() in ['help', '?']:
-                console.print(Panel("""
-[bold]Available Commands:[/bold]
-  • Just ask questions naturally - I'll automatically use tools when needed
-  • @web <query> - Explicitly search the web
+                console.print("""
+[yellow]Commands:[/yellow]
+  • Ask questions naturally - tools are used automatically
+  • @web <query> - Search the web
   • @curl <url> - Make HTTP request
-  • @bash <command> - Execute bash command
-  • clear - Clear conversation context
-  • exit/quit - Exit chat
+  • @bash <command> - Run bash command
+  • clear - Clear context
+  • exit/quit - Exit
 
-[bold]File Editing:[/bold]
-  • "Edit file.py to add X" - I'll modify the file automatically
-  • "Update app.js with new function" - I'll update the file
-  • "Fix the bug in utils.py" - I'll fix and save the file
+[yellow]Examples:[/yellow]
+  • "What does this project do?"
+  • "Read app.py"
+  • "Run git status"
+  • "Edit file.py to add error handling"
 
-[bold]Examples:[/bold]
-  • "What does this project do?" - I'll analyze the directory
-  • "Read app.py" - I'll read the file
-  • "Run git status" - I'll execute the command
-  • "Search for Python async best practices" - I'll search the web
-  • "Add error handling to main.py" - I'll edit and save the file
-
-[yellow]💡 Interrupt: Press Ctrl+C during any operation to stop and return to chat[/yellow]
-                """, title="Help", border_style="blue"))
+[yellow]Press Ctrl+C or ESC to interrupt operations[/yellow]
+                """)
                 continue
             
             if not user_input.strip():
@@ -1051,66 +1157,98 @@ def interactive_mode(
             tools = parse_tool_calls(user_input, current_dir)
             tool_results = []
             
-            # Read files automatically - Claude style
+            # Read files automatically
             if 'files' in tools:
                 for file_path in tools['files']:
-                    console.print(f"[dim]●[/dim] [bold]Read[/bold]({file_path})")
+                    console.print(f"[yellow]→ Reading: {file_path}[/yellow]")
                     file_content = load_file_context(file_path)
                     if file_content:
                         tool_results.append(f"File Content ({file_path}):\n{file_content}\n\n")
             
-            # Web search - Claude style
+            # Web search
             if 'web_search' in tools:
-                query_preview = tools['web_search'][:60] + ("..." if len(tools['web_search']) > 60 else "")
-                console.print(f"[dim]●[/dim] [bold]Web Search[/bold]({query_preview})")
+                console.print(f"[yellow]→ Searching web: {tools['web_search'][:60]}...[/yellow]")
                 search_result = web_search(tools['web_search'])
                 tool_results.append(f"Web Search Result:\n{search_result}\n")
             
-            # HTTP requests - Claude style
+            # HTTP requests
             if 'curl' in tools:
-                url_preview = tools['curl'][:60] + ("..." if len(tools['curl']) > 60 else "")
-                console.print(f"[dim]●[/dim] [bold]Fetch[/bold]({url_preview})")
+                console.print(f"[yellow]→ Fetching: {tools['curl'][:60]}...[/yellow]")
                 curl_result = curl_request(tools['curl'])
                 tool_results.append(f"Fetch Result:\n{curl_result}\n")
             
-            # Bash execution - Claude style
+            # Bash execution
             if 'bash' in tools:
-                cmd_preview = tools['bash'][:60] + ("..." if len(tools['bash']) > 60 else "")
-                console.print(f"[dim]●[/dim] [bold]Bash[/bold]({cmd_preview})")
+                console.print(f"[yellow]→ Executing: {tools['bash'][:60]}...[/yellow]")
                 stdout, stderr, code = execute_bash(tools['bash'], cwd=current_dir)
-                # Format bash output in Claude style
-                output_lines = stdout.split('\n') if stdout else []
-                if len(output_lines) > 10:
-                    preview = '\n'.join(output_lines[:8])
-                    tool_results.append(f"Bash Output:\n{preview}\n  ⎿  … +{len(output_lines) - 8} more lines\nReturn Code: {code}\n")
-                else:
-                    tool_results.append(f"Bash Output:\n{stdout}\nReturn Code: {code}\n")
+                tool_results.append(f"Command Output:\n{stdout}\nReturn Code: {code}\n")
                 if stderr:
-                    tool_results.append(f"Stderr: {stderr}\n")
+                    tool_results.append(f"Error: {stderr}\n")
             
             if tool_results:
                 user_input = f"{user_input}\n\n[Tool Execution Results]\n{''.join(tool_results)}"
             
             messages.append({"role": "user", "content": user_input})
             
-            # Make API call immediately (progress shown in stream_response)
-            interrupt_flag.clear()  # Reset interrupt flag
-            try:
-                # Start API call immediately - progress will show right away
-                response = client.chat(messages, stream=True)
-                assistant_response = stream_response(response, show_progress=True)
+            # Recursive tool execution loop - continue until no more tool calls
+            max_iterations = 10
+            iteration = 0
+            while iteration < max_iterations:
+                iteration += 1
                 
-                # Check if this was a file edit request
-                edit_info = detect_file_edit_request(user_input, assistant_response)
-                if edit_info and edit_info.get('code_blocks'):
-                    _handle_file_edit(edit_info, current_dir, console)
+                # Make API call immediately (progress shown in stream_response)
+                interrupt_flag.clear()  # Reset interrupt flag
+                try:
+                    # Start API call immediately - progress will show right away
+                    response = client.chat(messages, stream=True)
+                    assistant_response = stream_response(response, show_progress=True)
+                    
+                    # Check if this was a file edit request
+                    edit_info = detect_file_edit_request(user_input, assistant_response)
+                    if edit_info and edit_info.get('code_blocks'):
+                        _handle_file_edit(edit_info, current_dir, console)
+                    
+                    messages.append({"role": "assistant", "content": assistant_response})
+                    
+                    # Parse tool calls from assistant response
+                    tool_calls = parse_tool_calls_from_response(assistant_response, current_dir)
+                    tool_results = []
+                    
+                    # Execute tools if permissions allow
+                    if 'web_search' in tool_calls and permissions['web_search']:
+                        console.print(f"[yellow]→ Searching web: {tool_calls['web_search'][:60]}...[/yellow]")
+                        search_result = web_search(tool_calls['web_search'])
+                        tool_results.append(f"Web Search Result:\n{search_result}\n")
+                    
+                    if 'curl' in tool_calls and permissions['curl']:
+                        console.print(f"[yellow]→ Fetching: {tool_calls['curl'][:60]}...[/yellow]")
+                        curl_result = curl_request(tool_calls['curl'])
+                        tool_results.append(f"Fetch Result:\n{curl_result}\n")
+                    
+                    if 'bash' in tool_calls and permissions['bash']:
+                        console.print(f"[yellow]→ Executing: {tool_calls['bash'][:60]}...[/yellow]")
+                        stdout, stderr, code = execute_bash(tool_calls['bash'], cwd=current_dir)
+                        tool_results.append(f"Command Output:\n{stdout}\nReturn Code: {code}\n")
+                        if stderr:
+                            tool_results.append(f"Error: {stderr}\n")
+                    
+                    # If tools were executed, add results and continue loop
+                    if tool_results:
+                        tool_message = "[Tool Execution Results]\n" + ''.join(tool_results)
+                        messages.append({"role": "user", "content": tool_message})
+                        # Continue loop to get AI response to tool results
+                        continue
+                    else:
+                        # No more tool calls, break out of loop
+                        break
+                        
+                except KeyboardInterrupt:
+                    interrupt_flag.set()
+                    console.print("\n[yellow]⚠️  Operation interrupted. Returning to chat...[/yellow]")
+                    break
                 
-                messages.append({"role": "assistant", "content": assistant_response})
-                session_manager.update_session(session_id, messages)
-            except KeyboardInterrupt:
-                interrupt_flag.set()
-                console.print("\n[yellow]⚠️  Operation interrupted. Returning to chat...[/yellow]")
-                continue
+            # Save session after completing tool execution loop
+            session_manager.update_session(session_id, messages)
             
         except KeyboardInterrupt:
             if interrupt_flag.is_set():
