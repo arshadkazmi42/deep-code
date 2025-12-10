@@ -1051,13 +1051,19 @@ def interactive_mode(
             initial_query = f"{initial_query}\n\n[Tool Execution Results]\n{''.join(tool_results)}"
         
         messages.append({"role": "user", "content": initial_query})
-        console.print(f"[cyan]> {initial_query}[/cyan]\n")
+        console.print(f"[bold cyan]You:[/bold cyan] {initial_query}\n")
         
         # Recursive tool execution loop for initial query
         max_iterations = 10
         iteration = 0
         while iteration < max_iterations:
             iteration += 1
+            
+            # Add visual separator before AI response
+            if iteration == 1:  # Only show separator for first response
+                console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
+                console.print("[bold green]DeepSeek:[/bold green]")
+                console.print()
             
             # Make API call and stream response (progress shown in stream_response)
             response = client.chat(messages, stream=True)
@@ -1102,6 +1108,11 @@ def interactive_mode(
             else:
                 # No more tool calls, break out of loop
                 break
+        
+        # Add separator after AI response completes
+        console.print()
+        console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
+        console.print()
         
         session_manager.update_session(session_id, messages)
     
@@ -1150,8 +1161,8 @@ def interactive_mode(
             if not user_input.strip():
                 continue
             
-            # Add blank line after user input for spacing
-            console.print()
+            # Display user input prominently so it doesn't get lost
+            console.print(f"[bold cyan]You:[/bold cyan] {user_input}\n")
             
             # Auto-detect and execute tools
             tools = parse_tool_calls(user_input, current_dir)
@@ -1199,6 +1210,12 @@ def interactive_mode(
                 # Make API call immediately (progress shown in stream_response)
                 interrupt_flag.clear()  # Reset interrupt flag
                 try:
+                    # Add visual separator before AI response
+                    if iteration == 1:  # Only show separator for first response
+                        console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
+                        console.print("[bold green]DeepSeek:[/bold green]")
+                        console.print()
+                    
                     # Start API call immediately - progress will show right away
                     response = client.chat(messages, stream=True)
                     assistant_response = stream_response(response, show_progress=True)
@@ -1246,7 +1263,12 @@ def interactive_mode(
                     interrupt_flag.set()
                     console.print("\n[yellow]⚠️  Operation interrupted. Returning to chat...[/yellow]")
                     break
-                
+            
+            # Add separator after AI response completes
+            console.print()
+            console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
+            console.print()
+            
             # Save session after completing tool execution loop
             session_manager.update_session(session_id, messages)
             
