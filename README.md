@@ -2,6 +2,20 @@
 
 A command-line tool **exactly like Claude Code**, powered by DeepSeek's API. **Everything happens in interactive chat mode** - analyze code, search web, run commands, read files - all in one conversational interface.
 
+## 🎉 What's New in Version 2.0
+
+**Major Feature Release** - Deep Code now includes enterprise-grade features matching Claude Code:
+
+- 🛠️ **Structured Tool System** - 8 dedicated tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch
+- 🔒 **Advanced Security** - Command validation, dangerous operation blocking, sensitive file protection
+- 📊 **Context Management** - Token counting, smart truncation, conversation optimization
+- ✏️ **Precise Edit Tool** - Exact string matching for surgical code changes
+- 🔍 **Glob & Grep Tools** - Find files by pattern, search code with regex
+- ✅ **Comprehensive Tests** - Full test suite with 50+ tests
+- 📚 **Enhanced Documentation** - See [FEATURES.md](FEATURES.md) and [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
+
+**See [CHANGELOG.md](CHANGELOG.md) for full details.**
+
 ## Features
 
 - 💬 **Interactive Chat Mode** - Everything happens here! (Default mode)
@@ -242,3 +256,45 @@ Environment variables:
 - `DEEPSEEK_MODEL` - Default model (default: deepseek-chat - conversational chat model)
 
 Note: The default model is `deepseek-chat` which is optimized for conversational interactions. You can override this by setting `DEEPSEEK_MODEL` or using the `--model` flag.
+
+## Documentation
+
+- **[FEATURES.md](FEATURES.md)** - Comprehensive guide to all features, tools, and usage examples
+- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - Quick reference for common commands and patterns
+- **[CHANGELOG.md](CHANGELOG.md)** - Version history and what's new
+- **[INSTALL.md](INSTALL.md)** - Detailed installation instructions
+
+## Advanced Features
+
+### Structured Tools
+
+Deep Code includes 8 powerful tools:
+- **Read, Write, Edit** - File operations with precision
+- **Glob, Grep** - Find and search files
+- **Bash** - Execute commands safely
+- **WebSearch, WebFetch** - Access web content
+
+See [FEATURES.md](FEATURES.md) for detailed documentation.
+
+### Security
+
+Built-in security features:
+- Dangerous command blocking
+- Sensitive file protection
+- System directory safeguards
+- Permission management
+
+### Context Management
+
+- Token counting and optimization
+- Smart message truncation
+- Conversation summarization
+- Memory-efficient operation
+
+## Testing
+
+Run the comprehensive test suite:
+```bash
+python test_tools.py
+python -m unittest test_tools -v
+```

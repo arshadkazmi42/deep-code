@@ -83,12 +83,19 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
-# Import utils for file editing
+# Import utils for file editing and new advanced modules
 try:
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     from utils import extract_code_blocks, detect_file_edit_request, apply_code_changes
+    from tools import ToolRegistry, ToolResult
+    from security import SecurityValidator, SecurityConfig, PermissionManager
+    from context_manager import ContextManager, MessageBuilder
+    from ui import ModernUI
+    HAS_ADVANCED_FEATURES = True
 except ImportError:
+    HAS_ADVANCED_FEATURES = False
+    ModernUI = None
     # Fallback if utils.py not available - define inline
     def extract_code_blocks(text: str):
         """Extract code blocks from markdown text"""
@@ -833,29 +840,68 @@ def format_response_in_panel(text: str) -> None:
 
 
 def parse_tool_calls_from_response(response_text: str, current_dir: str = None) -> Dict[str, Any]:
-    """Parse tool calls from assistant response text - ONLY explicit tool calls"""
+    """Parse tool calls from assistant response text - ONLY explicit tool calls at start of lines"""
     tools = {}
-    
-    # Look for explicit tool calls in response ONLY
-    # Don't auto-detect URLs - only trigger on explicit @curl/@web/@bash commands
-    if '@web' in response_text.lower() or '@search' in response_text.lower():
-        match = re.search(r'@(?:web|search)\s+(.+?)(?:\n|$|\.)', response_text, re.IGNORECASE | re.DOTALL)
-        if match:
-            tools['web_search'] = match.group(1).strip()
-    
-    if '@curl' in response_text.lower() or '@request' in response_text.lower():
-        match = re.search(r'@(?:curl|request)\s+(.+?)(?:\n|$|\.)', response_text, re.IGNORECASE | re.DOTALL)
-        if match:
-            tools['curl'] = match.group(1).strip()
-    
-    if '@bash' in response_text.lower() or '@exec' in response_text.lower() or '@run' in response_text.lower():
-        match = re.search(r'@(?:bash|exec|run)\s+(.+?)(?:\n|$|\.)', response_text, re.IGNORECASE | re.DOTALL)
-        if match:
-            tools['bash'] = match.group(1).strip()
-    
-    # REMOVED: Automatic URL detection - was too aggressive and triggered on any URL mentioned
-    # Only trigger curl requests when explicitly requested with @curl or @request
-    
+
+    # IMPORTANT: Only match tool calls at the beginning of lines to avoid false positives
+    # This prevents matching when AI explains "you could use @bash git status"
+    # Only matches actual tool requests like:
+    #   @bash git status
+    #   @web search query
+
+    # Split into lines to check each one
+    lines = response_text.split('\n')
+
+    # Track if we're inside a code block
+    in_code_block = False
+
+    for line in lines:
+        line_stripped = line.strip()
+
+        # Check for code block markers
+        if line_stripped.startswith('```'):
+            in_code_block = not in_code_block
+            continue
+
+        # Skip lines inside code blocks
+        if in_code_block:
+            continue
+
+        # Skip lines that are clearly explanatory (common patterns)
+        if any(phrase in line.lower() for phrase in [
+            'you can use', 'you could use', 'try using', 'consider using',
+            'for example', 'like this', 'such as', 'you might', 'you should',
+            'would be', 'could be', 'can be', 'to use', 'using the',
+            'available:', 'syntax:', 'example:', 'usage:', 'command:',
+            'can run', 'could run', 'might want to', 'use `@'
+        ]):
+            continue
+
+        # Skip lines with inline code (contains backticks)
+        if '`' in line:
+            continue
+
+        # Only match if tool call is at the start of the line (after stripping)
+        # This ensures it's an intentional tool request, not explanation
+
+        # Web search - must start with @web or @search
+        if line_stripped.startswith('@web ') or line_stripped.startswith('@search '):
+            match = re.match(r'^@(?:web|search)\s+(.+)', line_stripped, re.IGNORECASE)
+            if match and 'web_search' not in tools:  # Only first match
+                tools['web_search'] = match.group(1).strip()
+
+        # HTTP request - must start with @curl or @request or @fetch
+        elif line_stripped.startswith('@curl ') or line_stripped.startswith('@request ') or line_stripped.startswith('@fetch '):
+            match = re.match(r'^@(?:curl|request|fetch)\s+(.+)', line_stripped, re.IGNORECASE)
+            if match and 'curl' not in tools:  # Only first match
+                tools['curl'] = match.group(1).strip()
+
+        # Bash execution - must start with @bash, @exec, or @run
+        elif line_stripped.startswith('@bash ') or line_stripped.startswith('@exec ') or line_stripped.startswith('@run '):
+            match = re.match(r'^@(?:bash|exec|run)\s+(.+)', line_stripped, re.IGNORECASE)
+            if match and 'bash' not in tools:  # Only first match
+                tools['bash'] = match.group(1).strip()
+
     return tools
 
 
@@ -964,36 +1010,87 @@ def parse_tool_calls(user_input: str, current_dir: str = None) -> Dict[str, Any]
 
 
 def build_system_prompt(add_dirs: List[str] = None, system_prompt: str = None, append_system_prompt: str = None) -> str:
-    """Build system prompt"""
-    base_prompt = """You are a helpful coding assistant with access to various tools that you can use automatically based on user requests:
+    """Build enhanced system prompt similar to Claude Code"""
+    base_prompt = """You are Deep Code, an advanced AI coding assistant with access to powerful tools for software development.
 
-TOOLS AVAILABLE:
-1. FILE OPERATIONS: You can read, analyze, and understand files. When users mention files, automatically read them.
-2. DIRECTORY ANALYSIS: You have access to the current directory structure and codebase. Use this context automatically.
-3. WEB SEARCH: Use @web or @search followed by a query to search the web when you need current information.
-4. HTTP REQUESTS: Use @curl or @request followed by a URL to make HTTP requests when users ask for API calls or web data.
-5. BASH EXECUTION: Use @bash, @exec, or @run followed by a command to execute shell commands when users want to run code, git operations, or system commands.
+# AVAILABLE TOOLS
 
-BEHAVIOR:
-- Automatically use tools when appropriate - don't wait for explicit permission
-- If user mentions a file path, automatically read it using the file system
-- If user asks about code in the current directory, use the directory context provided
-- If user asks for web information, use @web to search
-- If user wants to run a command, use @bash to execute it
-- If user asks to edit/modify/update/fix a file, provide the complete updated code in a code block with the file path
-- When providing code changes, format as: ```language:path/to/file\n[complete code]\n```
-- Always explain what you're doing before executing potentially destructive commands
-- Show tool outputs clearly and use them to answer questions
-- When editing files, provide the complete file content, not just the changed portion (unless it's a very large file)
+You have access to these tools that you can use automatically:
 
-Provide clear, concise, and accurate responses. When showing code, use proper syntax highlighting with file paths in code blocks."""
-    
+## File Operations
+- **Read**: Read file contents with optional line ranges. Use when users mention files or ask about code.
+- **Write**: Create new files or completely overwrite existing ones.
+- **Edit**: Make precise edits by replacing exact string matches. Use for surgical changes to existing files.
+- **Glob**: Find files using patterns (e.g., '**/*.py', 'src/**/*.ts'). Use to discover files.
+- **Grep**: Search file contents using regex patterns. Use to find code across the codebase.
+
+## Command Execution
+- **Bash**: Execute shell commands. Always explain dangerous commands before running them.
+  - Examples: git operations, running tests, installing packages, building projects
+
+## Web Access
+- **WebSearch**: Search the web using DuckDuckGo when you need current information.
+- **WebFetch**: Make HTTP requests (GET, POST, PUT, DELETE) to fetch data from URLs.
+
+# TOOL USAGE SYNTAX
+
+When you want to use tools, use this format:
+- Files: `@read path/to/file` or just mention the file path naturally
+- Search code: `@grep pattern` or `@grep "function.*async"`
+- Find files: `@glob "**/*.py"` or `@glob "src/**/*.ts"`
+- Execute: `@bash command` or `@run command`
+- Web search: `@web query` or `@search query`
+- HTTP: `@curl https://api.example.com` or `@fetch URL`
+
+# BEHAVIOR GUIDELINES
+
+1. **Be Proactive**: Automatically use tools when needed. Don't ask for permission for safe operations.
+
+2. **File Operations**:
+   - Always use Read before Edit to see current content
+   - Use Edit for precise changes with exact string matching
+   - Use Write for creating new files or complete rewrites
+   - Preserve indentation and formatting exactly when editing
+
+3. **Code Understanding**:
+   - Use Grep to search for patterns across multiple files
+   - Use Glob to find relevant files before reading them
+   - Read directory context that's automatically provided
+
+4. **Command Execution**:
+   - Explain what commands do before running them
+   - Warn about destructive operations (rm, format, etc.)
+   - Show command outputs clearly
+
+5. **Edit Format**:
+   When editing files, provide code in this format:
+   ```language:path/to/file
+   [complete code or the section to replace]
+   ```
+
+6. **Safety**:
+   - Never run commands that could delete important data without confirmation
+   - Validate file paths before operations
+   - Explain risks of dangerous operations
+
+7. **Response Quality**:
+   - Be concise but complete
+   - Use proper syntax highlighting
+   - Show file paths with line numbers when relevant
+   - Format output clearly with headers and structure
+
+# WORKING DIRECTORY
+
+You have automatic access to the current working directory's structure and key files. Use this context to understand the project before making changes.
+
+Remember: You're a powerful assistant. Use your tools proactively to help users accomplish their goals efficiently and safely."""
+
     if system_prompt:
         return system_prompt
-    
+
     if append_system_prompt:
         base_prompt += "\n\n" + append_system_prompt
-    
+
     return base_prompt
 
 
@@ -1151,28 +1248,71 @@ def interactive_mode(
     initial_query: str = None
 ):
     """Interactive REPL mode - Everything happens here in chat"""
-    # Start with directory context loaded
+    # Start with system message only - directory context will load in background
     messages = build_messages(
-        query=None,  # Don't add query yet, just context
-        current_dir=current_dir,
-        add_dirs=add_dirs,
+        query=None,  # Don't add query yet
+        current_dir=None,  # Don't load directory context synchronously
+        add_dirs=None,  # Don't load add_dirs synchronously
         system_prompt=system_prompt,
         append_system_prompt=append_system_prompt
     )
     
-    # Show minimal Claude-like welcome
-    console.print(f"[cyan]Deep Code - Interactive Chat Mode[/cyan]")
-    console.print(f"[dim]Directory: {current_dir}[/dim]\n")
-    if add_dirs:
-        console.print(f"[dim]Additional directories: {', '.join(add_dirs)}[/dim]")
+    # Load directory context in background thread (don't block startup)
+    dir_context_ready = threading.Event()
+    dir_context_result = {"context": None, "add_dirs_context": []}
     
+    def load_dir_context_background():
+        """Load directory context in background"""
+        try:
+            if current_dir:
+                dir_context = load_directory_context(current_dir)
+                if dir_context:
+                    dir_context_result["context"] = dir_context
+            
+            if add_dirs:
+                for add_dir in add_dirs:
+                    dir_context = load_directory_context(add_dir)
+                    if dir_context:
+                        dir_context_result["add_dirs_context"].append((add_dir, dir_context))
+            
+            dir_context_ready.set()
+        except Exception:
+            dir_context_ready.set()
+    
+    # Start background loading
+    dir_context_thread = threading.Thread(target=load_dir_context_background, daemon=True)
+    dir_context_thread.start()
+    
+    # Initialize UI (use modern if available, fallback to basic)
+    ui = ModernUI(console) if HAS_ADVANCED_FEATURES and ModernUI else None
+
+    # Show welcome screen
+    if ui:
+        ui.show_welcome(current_dir, add_dirs)
+    else:
+        console.print(f"[cyan]Deep Code - Interactive Chat Mode[/cyan]")
+        console.print(f"[dim]Directory: {current_dir}[/dim]\n")
+        if add_dirs:
+            console.print(f"[dim]Additional directories: {', '.join(add_dirs)}[/dim]")
+
     # Request permissions for automatic tool execution (ask once per session)
-    console.print("[yellow]Automatic Tool Execution Permissions:[/yellow]")
-    permissions = {
-        'curl': Confirm.ask("  Allow automatic curl/web requests?", default=True),
-        'bash': Confirm.ask("  Allow automatic bash command execution?", default=True),
-        'web_search': Confirm.ask("  Allow automatic web searches?", default=True)
-    }
+    if ui:
+        console.print(f"[{ui.colors['primary']}]Tool Permissions[/{ui.colors['primary']}]")
+        console.print(f"[{ui.colors['muted']}]Allow automatic execution of:[/{ui.colors['muted']}]")
+        console.print()
+        permissions = {
+            'curl': ui.confirm("  HTTP requests (curl)?", default=True),
+            'bash': ui.confirm("  Shell commands (bash)?", default=True),
+            'web_search': ui.confirm("  Web searches?", default=True)
+        }
+    else:
+        console.print("[yellow]Automatic Tool Execution Permissions:[/yellow]")
+        permissions = {
+            'curl': Confirm.ask("  Allow automatic curl/web requests?", default=True),
+            'bash': Confirm.ask("  Allow automatic bash command execution?", default=True),
+            'web_search': Confirm.ask("  Allow automatic web searches?", default=True)
+        }
+
     console.print()
     console.print("[dim]Type 'help' for commands, 'exit' to quit, Ctrl+C or ESC to interrupt[/dim]\n")
     
@@ -1215,7 +1355,9 @@ def interactive_mode(
         console.print(f"[bold cyan]You:[/bold cyan] {initial_query}\n")
         
         # Recursive tool execution loop for initial query
-        max_iterations = 10
+        # Reduced from 10 to 3 to prevent excessive auto-execution
+        # If AI needs more iterations, user can provide follow-up commands
+        max_iterations = 3
         iteration = 0
         while iteration < max_iterations:
             iteration += 1
@@ -1225,6 +1367,44 @@ def interactive_mode(
                 console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
                 console.print("[bold green]DeepSeek:[/bold green]")
                 console.print()
+            
+            # Add directory context to messages if it's ready (before first API call)
+            if iteration == 1:
+                # Wait briefly for directory context if it's not ready yet
+                if not dir_context_ready.is_set():
+                    dir_context_ready.wait(timeout=2.0)  # Wait up to 2 seconds
+                
+                if dir_context_result["context"]:
+                    messages.insert(1, {
+                        "role": "user",
+                        "content": f"Here is the current directory context:\n\n{dir_context_result['context']}"
+                    })
+                
+                # Add additional directories context
+                for add_dir, dir_context in dir_context_result["add_dirs_context"]:
+                    messages.append({
+                        "role": "user",
+                        "content": f"Here is additional directory context from {add_dir}:\n\n{dir_context}"
+                    })
+            
+            # Add directory context to messages if it's ready (before first API call)
+            if iteration == 1:
+                # Wait briefly for directory context if it's not ready yet
+                if not dir_context_ready.is_set():
+                    dir_context_ready.wait(timeout=2.0)  # Wait up to 2 seconds
+                
+                if dir_context_result["context"]:
+                    messages.insert(1, {
+                        "role": "user",
+                        "content": f"Here is the current directory context:\n\n{dir_context_result['context']}"
+                    })
+                
+                # Add additional directories context
+                for add_dir, dir_context in dir_context_result["add_dirs_context"]:
+                    messages.append({
+                        "role": "user",
+                        "content": f"Here is additional directory context from {add_dir}:\n\n{dir_context}"
+                    })
             
             # Make API call and stream response (progress shown in stream_response)
             response = client.chat(messages, stream=True)
@@ -1269,7 +1449,11 @@ def interactive_mode(
             else:
                 # No more tool calls, break out of loop
                 break
-        
+
+        # Check if we hit max iterations
+        if iteration >= max_iterations and tool_results:
+            console.print("[yellow]ℹ️  Reached auto-execution limit. Provide another command to continue.[/yellow]")
+
         # Add separator after AI response completes
         console.print()
         console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
@@ -1280,11 +1464,18 @@ def interactive_mode(
     # Main interactive loop
     while True:
         try:
-            console.print("> ", end="", style="cyan")
-            user_input = input()
-            
+            # Get user input with modern UI if available
+            if ui:
+                user_input = ui.prompt_input("❯")
+            else:
+                console.print("> ", end="", style="cyan")
+                user_input = input()
+
             if user_input.lower() in ['exit', 'quit', 'q']:
-                console.print("[yellow]Goodbye![/yellow]")
+                if ui:
+                    ui.show_goodbye()
+                else:
+                    console.print("[yellow]Goodbye![/yellow]")
                 break
             
             if user_input.lower() == 'clear':
@@ -1300,7 +1491,10 @@ def interactive_mode(
                 continue
             
             if user_input.lower() in ['help', '?']:
-                console.print("""
+                if ui:
+                    ui.show_help()
+                else:
+                    console.print("""
 [yellow]Commands:[/yellow]
   • Ask questions naturally - tools are used automatically
   • @web <query> - Search the web
@@ -1316,14 +1510,17 @@ def interactive_mode(
   • "Edit file.py to add error handling"
 
 [yellow]Press Ctrl+C or ESC to interrupt operations and return to chat[/yellow]
-                """)
+                    """)
                 continue
-            
+
             if not user_input.strip():
                 continue
-            
-            # Display user input prominently so it doesn't get lost
-            console.print(f"[bold cyan]You:[/bold cyan] {user_input}\n")
+
+            # Display user input
+            if ui:
+                ui.show_user_input(user_input)
+            else:
+                console.print(f"[bold cyan]You:[/bold cyan] {user_input}\n")
             
             # Auto-detect and execute tools
             tools = parse_tool_calls(user_input, current_dir)
@@ -1332,27 +1529,48 @@ def interactive_mode(
             # Read files automatically
             if 'files' in tools:
                 for file_path in tools['files']:
-                    console.print(f"[yellow]→ Reading: {file_path}[/yellow]")
+                    if ui:
+                        ui.show_tool_call('read', {'file_path': file_path})
+                    else:
+                        console.print(f"[yellow]→ Reading: {file_path}[/yellow]")
                     file_content = load_file_context(file_path)
                     if file_content:
+                        if ui:
+                            ui.show_tool_result('read', file_content, success=True)
                         tool_results.append(f"File Content ({file_path}):\n{file_content}\n\n")
-            
+
             # Web search
             if 'web_search' in tools:
-                console.print(f"[yellow]→ Searching web: {tools['web_search'][:60]}...[/yellow]")
+                if ui:
+                    ui.show_tool_call('web_search', {'query': tools['web_search']})
+                else:
+                    console.print(f"[yellow]→ Searching web: {tools['web_search'][:60]}...[/yellow]")
                 search_result = web_search(tools['web_search'])
+                if ui:
+                    ui.show_tool_result('web_search', search_result, success=True)
                 tool_results.append(f"Web Search Result:\n{search_result}\n")
-            
+
             # HTTP requests
             if 'curl' in tools:
-                console.print(f"[yellow]→ Fetching: {tools['curl'][:60]}...[/yellow]")
+                if ui:
+                    ui.show_tool_call('curl', {'url': tools['curl']})
+                else:
+                    console.print(f"[yellow]→ Fetching: {tools['curl'][:60]}...[/yellow]")
                 curl_result = curl_request(tools['curl'])
+                if ui:
+                    ui.show_tool_result('curl', curl_result, success=True)
                 tool_results.append(f"Fetch Result:\n{curl_result}\n")
-            
+
             # Bash execution
             if 'bash' in tools:
-                console.print(f"[yellow]→ Executing: {tools['bash'][:60]}...[/yellow]")
+                if ui:
+                    ui.show_tool_call('bash', {'command': tools['bash']})
+                else:
+                    console.print(f"[yellow]→ Executing: {tools['bash'][:60]}...[/yellow]")
                 stdout, stderr, code = execute_bash(tools['bash'], cwd=current_dir)
+                output = stdout if code == 0 else (stderr or stdout)
+                if ui:
+                    ui.show_tool_result('bash', output, success=(code == 0))
                 tool_results.append(f"Command Output:\n{stdout}\nReturn Code: {code}\n")
                 if stderr:
                     tool_results.append(f"Error: {stderr}\n")
@@ -1363,7 +1581,9 @@ def interactive_mode(
             messages.append({"role": "user", "content": user_input})
             
             # Recursive tool execution loop - continue until no more tool calls
-            max_iterations = 10
+            # Reduced from 10 to 3 to prevent excessive auto-execution
+            # If AI needs more iterations, user can provide follow-up commands
+            max_iterations = 3
             iteration = 0
             while iteration < max_iterations:
                 iteration += 1
@@ -1373,9 +1593,29 @@ def interactive_mode(
                 try:
                     # Add visual separator before AI response
                     if iteration == 1:  # Only show separator for first response
-                        console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
-                        console.print("[bold green]DeepSeek:[/bold green]")
-                        console.print()
+                        if not ui:
+                            console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
+                            console.print("[bold green]DeepSeek:[/bold green]")
+                            console.print()
+                    
+                    # Add directory context to messages if it's ready (before first API call)
+                    if iteration == 1:
+                        # Wait briefly for directory context if it's not ready yet
+                        if not dir_context_ready.is_set():
+                            dir_context_ready.wait(timeout=2.0)  # Wait up to 2 seconds
+                        
+                        if dir_context_result["context"]:
+                            messages.insert(1, {
+                                "role": "user",
+                                "content": f"Here is the current directory context:\n\n{dir_context_result['context']}"
+                            })
+                        
+                        # Add additional directories context
+                        for add_dir, dir_context in dir_context_result["add_dirs_context"]:
+                            messages.append({
+                                "role": "user",
+                                "content": f"Here is additional directory context from {add_dir}:\n\n{dir_context}"
+                            })
                     
                     # Start API call immediately - progress will show right away
                     # ESC key monitoring will be started inside stream_response
@@ -1395,18 +1635,34 @@ def interactive_mode(
                     
                     # Execute tools if permissions allow
                     if 'web_search' in tool_calls and permissions['web_search']:
-                        console.print(f"[yellow]→ Searching web: {tool_calls['web_search'][:60]}...[/yellow]")
+                        if ui:
+                            ui.show_tool_call('web_search', {'query': tool_calls['web_search']})
+                        else:
+                            console.print(f"[yellow]→ Searching web: {tool_calls['web_search'][:60]}...[/yellow]")
                         search_result = web_search(tool_calls['web_search'])
+                        if ui:
+                            ui.show_tool_result('web_search', search_result, success=True)
                         tool_results.append(f"Web Search Result:\n{search_result}\n")
-                    
+
                     if 'curl' in tool_calls and permissions['curl']:
-                        console.print(f"[yellow]→ Fetching: {tool_calls['curl'][:60]}...[/yellow]")
+                        if ui:
+                            ui.show_tool_call('curl', {'url': tool_calls['curl']})
+                        else:
+                            console.print(f"[yellow]→ Fetching: {tool_calls['curl'][:60]}...[/yellow]")
                         curl_result = curl_request(tool_calls['curl'])
+                        if ui:
+                            ui.show_tool_result('curl', curl_result, success=True)
                         tool_results.append(f"Fetch Result:\n{curl_result}\n")
-                    
+
                     if 'bash' in tool_calls and permissions['bash']:
-                        console.print(f"[yellow]→ Executing: {tool_calls['bash'][:60]}...[/yellow]")
+                        if ui:
+                            ui.show_tool_call('bash', {'command': tool_calls['bash']})
+                        else:
+                            console.print(f"[yellow]→ Executing: {tool_calls['bash'][:60]}...[/yellow]")
                         stdout, stderr, code = execute_bash(tool_calls['bash'], cwd=current_dir)
+                        output = stdout if code == 0 else (stderr or stdout)
+                        if ui:
+                            ui.show_tool_result('bash', output, success=(code == 0))
                         tool_results.append(f"Command Output:\n{stdout}\nReturn Code: {code}\n")
                         if stderr:
                             tool_results.append(f"Error: {stderr}\n")
@@ -1420,17 +1676,27 @@ def interactive_mode(
                     else:
                         # No more tool calls, break out of loop
                         break
-                        
+
                 except KeyboardInterrupt:
                     interrupt_flag.set()
                     stop_esc_monitor()  # Ensure ESC monitor is stopped
                     console.print("\n[yellow]⚠️  Operation interrupted (ESC or Ctrl+C). Returning to chat...[/yellow]")
                     break
-            
+
+            # Check if we hit max iterations
+            if iteration >= max_iterations and tool_results:
+                if ui:
+                    ui.show_info("Reached auto-execution limit. Provide another command to continue.")
+                else:
+                    console.print("[yellow]ℹ️  Reached auto-execution limit. Provide another command to continue.[/yellow]")
+
             # Add separator after AI response completes
-            console.print()
-            console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
-            console.print()
+            if ui:
+                ui.show_divider()
+            else:
+                console.print()
+                console.print("[dim]─────────────────────────────────────────────────────────────────────────────[/dim]")
+                console.print()
             
             # Save session after completing tool execution loop
             session_manager.update_session(session_id, messages)

@@ -1,0 +1,246 @@
+name: Build Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 2.0.0)'
+        required: true
+        default: '2.0.0'
+
+jobs:
+  build:
+    name: Build ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      matrix:
+        config:
+          - name: Windows x64
+            os: windows-latest
+            platform: windows
+            binary_name: deepcode-2.0.0-windows-x64.exe
+            artifact_name: deepcode-windows-x64
+
+          - name: macOS Intel
+            os: macos-13
+            platform: macos-intel
+            binary_name: deepcode-2.0.0-macos-intel
+            artifact_name: deepcode-macos-intel
+
+          - name: macOS ARM (M1/M2)
+            os: macos-14
+            platform: macos-arm
+            binary_name: deepcode-2.0.0-macos-arm
+            artifact_name: deepcode-macos-arm
+
+          - name: Linux x64
+            os: ubuntu-latest
+            platform: linux
+            binary_name: deepcode-2.0.0-linux-x64
+            artifact_name: deepcode-linux-x64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          pyinstaller \
+            --name="${{ matrix.config.binary_name }}" \
+            --onefile \
+            --console \
+            --clean \
+            --noconfirm \
+            --hidden-import=tiktoken_ext.openai_public \
+            --hidden-import=tiktoken_ext \
+            --hidden-import=rich.markdown \
+            --hidden-import=rich.syntax \
+            --collect-data tiktoken \
+            --exclude-module matplotlib \
+            --exclude-module numpy \
+            --exclude-module pandas \
+            deepcode.py
+
+      - name: Build binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller `
+            --name="${{ matrix.config.binary_name }}" `
+            --onefile `
+            --console `
+            --clean `
+            --noconfirm `
+            --hidden-import=tiktoken_ext.openai_public `
+            --hidden-import=tiktoken_ext `
+            --hidden-import=rich.markdown `
+            --hidden-import=rich.syntax `
+            --collect-data tiktoken `
+            --exclude-module matplotlib `
+            --exclude-module numpy `
+            --exclude-module pandas `
+            deepcode.py
+
+      - name: Create distribution package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist-package
+          cp dist/${{ matrix.config.binary_name }} dist-package/
+          cp README.md FEATURES.md QUICK_REFERENCE.md SETUP.md dist-package/ || true
+
+          cd dist-package
+          cat > README_BINARY.txt << EOF
+          # Deep Code 2.0.0 - Binary Distribution
+
+          ## Quick Start
+
+          1. Set your API key:
+             export DEEPSEEK_API_KEY=your_api_key_here
+
+          2. Run Deep Code:
+             ./${{ matrix.config.binary_name }}
+
+          ## Platform
+
+          - Platform: ${{ matrix.config.platform }}
+          - Built on: $(date)
+
+          ## Usage
+
+          # Interactive mode
+          ./${{ matrix.config.binary_name }}
+
+          # With question
+          ./${{ matrix.config.binary_name }} "What does this project do?"
+
+          ## Get API Key
+
+          https://platform.deepseek.com/
+          EOF
+
+          cd ..
+          tar -czf ${{ matrix.config.artifact_name }}.tar.gz -C dist-package .
+
+      - name: Create distribution package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-package
+          Copy-Item dist/${{ matrix.config.binary_name }} dist-package/
+          Copy-Item README.md, FEATURES.md, QUICK_REFERENCE.md, SETUP.md dist-package/ -ErrorAction SilentlyContinue
+
+          @"
+          # Deep Code 2.0.0 - Binary Distribution
+
+          ## Quick Start
+
+          1. Set your API key:
+             set DEEPSEEK_API_KEY=your_api_key_here
+
+          2. Run Deep Code:
+             ${{ matrix.config.binary_name }}
+
+          ## Platform
+
+          - Platform: ${{ matrix.config.platform }}
+          - Built on: $(Get-Date)
+
+          ## Usage
+
+          # Interactive mode
+          ${{ matrix.config.binary_name }}
+
+          # With question
+          ${{ matrix.config.binary_name }} "What does this project do?"
+
+          ## Get API Key
+
+          https://platform.deepseek.com/
+          "@ | Out-File -FilePath dist-package/README_BINARY.txt -Encoding UTF8
+
+          Compress-Archive -Path dist-package/* -DestinationPath ${{ matrix.config.artifact_name }}.zip
+
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.config.artifact_name }}
+          path: ${{ matrix.config.artifact_name }}.tar.gz
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.config.artifact_name }}
+          path: ${{ matrix.config.artifact_name }}.zip
+
+  create-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## Deep Code ${{ github.ref_name }}
+
+            ### 🎉 Release Binaries
+
+            Download the binary for your platform:
+
+            - **Windows**: `deepcode-windows-x64.zip`
+            - **macOS Intel**: `deepcode-macos-intel.tar.gz`
+            - **macOS Apple Silicon**: `deepcode-macos-arm.tar.gz`
+            - **Linux**: `deepcode-linux-x64.tar.gz`
+
+            ### 📦 Installation
+
+            1. Download and extract the archive for your platform
+            2. Set your API key: `export DEEPSEEK_API_KEY=your_key`
+            3. Run: `./deepcode` (or `deepcode.exe` on Windows)
+
+            ### 🔑 Get API Key
+
+            Get your DeepSeek API key: https://platform.deepseek.com/
+
+            ### 📚 Documentation
+
+            - [Features Guide](FEATURES.md)
+            - [Quick Reference](QUICK_REFERENCE.md)
+            - [Setup Guide](SETUP.md)
+
+            ### ✨ What's New
+
+            See [CHANGELOG.md](CHANGELOG.md) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

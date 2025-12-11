@@ -11,12 +11,19 @@ except FileNotFoundError:
 
 setup(
     name="deep-code",
-    version="1.0.0",
+    version="2.0.0",
     author="Deep Code CLI",
     description="CLI tool powered by DeepSeek API - similar to Claude Code",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    py_modules=["deepcode"],
+    py_modules=[
+        "deepcode",
+        "tools",
+        "security",
+        "context_manager",
+        "ui",
+        "utils"
+    ],
     install_requires=[
         "openai>=1.12.0",
         "python-dotenv>=1.0.0",
@@ -24,6 +31,7 @@ setup(
         "pyyaml>=6.0.1",
         "requests>=2.31.0",
         "beautifulsoup4>=4.12.0",
+        "tiktoken>=0.5.0",
     ],
     entry_points={
         "console_scripts": [
